@@ -9,7 +9,7 @@ use ratatui::{
     backend::CrosstermBackend,
     widgets::{Block, Borders, Tabs, Paragraph, List, ListItem},
     layout::{Layout, Direction, Constraint},
-    style::{Style, Color},
+    style::{Style, Color, Modifier},
     text::{Line, Span},
     Terminal,
 };
@@ -27,6 +27,8 @@ struct App {
     show_editor_selection: bool,
     selected_editor: usize,
     current_dir_contents: Vec<DirEntry>,
+    selected_item: Option<usize>,
+    show_confirmation: bool,
 }
 
 #[derive(Clone)]
@@ -48,14 +50,21 @@ impl App {
             }
         }
         
-        Ok(App {
+        let mut app = App {
             tabs,
             current_tab: 0,
-            show_content: false,
+            show_content: true,  // Set to true by default
             show_editor_selection: false,
             selected_editor: 0,
             current_dir_contents: Vec::new(),
-        })
+            selected_item: None,
+            show_confirmation: false,
+        };
+        
+        // Initialize directory contents
+        app.update_current_dir_contents()?;
+        
+        Ok(app)
     }
 
     fn update_current_dir_contents(&mut self) -> io::Result<()> {
@@ -77,7 +86,6 @@ impl App {
             }
         }
 
-        // Sort directories first, then files, both alphabetically
         contents.sort_by(|a, b| {
             match (a.is_dir, b.is_dir) {
                 (true, false) => std::cmp::Ordering::Less,
@@ -87,6 +95,15 @@ impl App {
         });
 
         self.current_dir_contents = contents;
+        Ok(())
+    }
+
+    fn switch_tab(&mut self, tab_index: usize) -> io::Result<()> {
+        if tab_index < self.tabs.len() {
+            self.current_tab = tab_index;
+            self.selected_item = None;
+            self.update_current_dir_contents()?;
+        }
         Ok(())
     }
 }
@@ -123,6 +140,7 @@ fn main() -> io::Result<()> {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
+                    Constraint::Length(3),
                     Constraint::Length(3),
                     Constraint::Length(3),
                     Constraint::Min(0),
@@ -176,19 +194,51 @@ fn main() -> io::Result<()> {
                 .highlight_style(Style::default().fg(Color::Yellow));
             
             f.render_widget(tabs, chunks[1]);
+
+            // Keyboard shortcuts
+            let shortcuts = vec![
+                Span::styled("1-9", Style::default().fg(Color::Yellow)),
+                Span::raw(": Switch Tabs | "),
+                Span::styled("↑/↓", Style::default().fg(Color::Yellow)),
+                Span::raw(": Navigate | "),
+                Span::styled("Enter", Style::default().fg(Color::Yellow)),
+                Span::raw(": Select | "),
+                Span::styled("y/n", Style::default().fg(Color::Yellow)),
+                Span::raw(": Confirm | "),
+                Span::styled("q", Style::default().fg(Color::Yellow)),
+                Span::raw(": Quit"),
+            ];
+        
+            f.render_widget(
+                Paragraph::new(Line::from(shortcuts))
+                    .block(Block::default().borders(Borders::ALL))
+                    .style(Style::default().fg(Color::White)),
+                chunks[2],
+            );
             
             // Content area
             if app.show_content {
                 let items: Vec<ListItem> = app.current_dir_contents
                     .iter()
-                    .map(|entry| {
-                        let prefix = if entry.is_dir { "📁 " } else { "📄 " };
+                    .enumerate()
+                    .map(|(index, entry)| {
+                        let is_selected = app.selected_item == Some(index);
+                        let (icon, color) = if entry.is_dir {
+                            ("📁", Color::Cyan)
+                        } else {
+                            ("📄", Color::White)
+                        };
+                        
+                        let style = if is_selected {
+                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(color)
+                        };
+                        
                         let content = Line::from(vec![
-                            Span::raw(prefix),
-                            Span::styled(
-                                &entry.name,
-                                Style::default().fg(if entry.is_dir { Color::Blue } else { Color::White })
-                            )
+                            Span::raw(icon),
+                            Span::raw(" "),
+                            Span::styled(&entry.name, style)
                         ]);
                         ListItem::new(content)
                     })
@@ -199,7 +249,18 @@ fn main() -> io::Result<()> {
                         .title(format!(" Contents of {} ", app.tabs[app.current_tab]))
                         .borders(Borders::ALL));
 
-                f.render_widget(list, chunks[2]);
+                f.render_widget(list, chunks[3]);
+            }
+
+            // Add confirmation popup if needed
+            if app.show_confirmation {
+                let popup = Paragraph::new("Open in Neovim? (y/n)")
+                    .block(Block::default()
+                        .borders(Borders::ALL)
+                        .style(Style::default().fg(Color::Yellow)));
+                
+                let area = centered_rect(30, 20, size);
+                f.render_widget(popup, area);
             }
             
             // Editor selection popup
@@ -210,8 +271,6 @@ fn main() -> io::Result<()> {
                 
                 let editors = vec!["VSCode", "Neovim"];
                 let editor_text = editors.join("\n");
-                let selected_style = Style::default().fg(Color::Yellow);
-                
                 let popup = Paragraph::new(editor_text)
                     .block(popup_block)
                     .style(Style::default());
@@ -221,53 +280,77 @@ fn main() -> io::Result<()> {
             }
         })?;
         
+    // ******************************** start ***********************************************
+        
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Char('q') => break,
-                    KeyCode::Char(num) => {
-                        if let Some(digit) = num.to_digit(10) {
-                            let index = digit as usize - 1;
-                            if index < app.tabs.len() {
-                                app.current_tab = index;
-                                app.show_content = true;
-                                app.update_current_dir_contents()?;
+                    KeyCode::Char(c) => {
+                        // Handle number keys 1-9 for tab switching
+                        if let Some(digit) = c.to_digit(10) {
+                            if digit > 0 && digit <= 9 {
+                                app.switch_tab((digit - 1) as usize)?;
                             }
                         }
                     },
-                    KeyCode::Char('c') => app.show_content = false,
-                    KeyCode::Char('o') => app.show_editor_selection = true,
-                    KeyCode::Up if app.show_editor_selection => {
-                        app.selected_editor = 0;
-                    },
-                    KeyCode::Down if app.show_editor_selection => {
-                        app.selected_editor = 1;
-                    },
-                    KeyCode::Enter if app.show_editor_selection => {
-                        let path = Path::new("~/Documents/rakesh/projects")
-                            .expand_home()?
-                            .join(&app.tabs[app.current_tab]);
-                        
-                        match app.selected_editor {
-                            0 => { // VSCode
-                                Command::new("code")
-                                    .arg(path)
-                                    .spawn()?;
-                            },
-                            1 => { // Neovim
-                                Command::new("nvim")
-                                    .arg(path)
-                                    .spawn()?;
-                            },
-                            _ => {},
+                    KeyCode::Up => {
+                        if app.show_content {
+                            if let Some(selected) = app.selected_item {
+                                if selected > 0 {
+                                    app.selected_item = Some(selected - 1);
+                                }
+                            } else {
+                                app.selected_item = Some(0);
+                            }
                         }
-                        app.show_editor_selection = false;
+                    },
+                    KeyCode::Down => {
+                        if app.show_content {
+                            if let Some(selected) = app.selected_item {
+                                if selected < app.current_dir_contents.len() - 1 {
+                                    app.selected_item = Some(selected + 1);
+                                }
+                            } else {
+                                app.selected_item = Some(0);
+                            }
+                        }
+                    },
+                    KeyCode::Enter => {
+                        if app.show_content && app.selected_item.is_some() {
+                            app.show_confirmation = false;
+                        }
+                    },
+                    KeyCode::Char('y') if app.show_confirmation => {
+                        if let Some(selected) = app.selected_item {
+                            let entry = &app.current_dir_contents[selected];
+                            let path = Path::new("~/Documents/rakesh/projects")
+                                .expand_home()?
+                                .join(&app.tabs[app.current_tab])
+                                .join(&entry.name);
+                            
+                            Command::new("alacritty")
+                                .args(&["-e", "nvim"])
+                                .arg(path)
+                                .spawn()?;
+                        }
+                        app.show_confirmation = false;
+                    },
+                    KeyCode::Char('n') if app.show_confirmation => {
+                        app.show_confirmation = false;
                     },
                     KeyCode::Esc => app.show_editor_selection = false,
                     _ => {},
                 }
             }
         }
+
+
+
+
+
+    // ******************************** END ***********************************************
+
     }
     
     disable_raw_mode()?;
